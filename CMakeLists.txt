@@ -16,6 +16,9 @@ find_package(rclcpp REQUIRED)
 find_package(rclcpp_components REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
+find_package(visualization_msgs REQUIRED)
+find_package(pcl_conversions REQUIRED)
+find_package(PCL REQUIRED COMPONENTS common io)
 
 # Find LibTorch
 set(CMAKE_PREFIX_PATH "${CMAKE_CURRENT_SOURCE_DIR}/libtorch")
@@ -26,6 +29,7 @@ set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 include_directories(
   include
   ${TORCH_INCLUDE_DIRS}
+  ${PCL_INCLUDE_DIRS}
 )
 
 # Create the component library
@@ -36,6 +40,7 @@ add_library(lidar_processor_component SHARED
 target_include_directories(lidar_processor_component PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>
+  ${PCL_INCLUDE_DIRS}
 )
 
 target_compile_definitions(lidar_processor_component
@@ -47,10 +52,13 @@ ament_target_dependencies(lidar_processor_component
   rclcpp_components
   sensor_msgs
   std_msgs
+  visualization_msgs
+  pcl_conversions
 )
 
 target_link_libraries(lidar_processor_component
   ${TORCH_LIBRARIES}
+  ${PCL_LIBRARIES}
 )
 
 # Register the component
@@ -72,18 +80,22 @@ install(DIRECTORY include/
   DESTINATION include
 )
 
-# Install launch files if any
+# Install launch files
 install(DIRECTORY
   launch
   DESTINATION share/${PROJECT_NAME}
-  OPTIONAL
 )
 
-# Install config files if any
+# Install config files
 install(DIRECTORY
   config
   DESTINATION share/${PROJECT_NAME}
-  OPTIONAL
+)
+
+# Install Python scripts
+install(PROGRAMS
+  scripts/prepare_model.py
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 if(BUILD_TESTING)
