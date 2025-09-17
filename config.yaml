@@ -1,0 +1,60 @@
+lidar_processor:
+  ros__parameters:
+    # Model configuration
+    model_path: ""  # Path to your converted .pt model file
+    num_classes: 20  # Number of semantic classes (20 for KITTI, 17 for NuScenes)
+    
+    # Input/Output topics
+    input_topic: "/velodyne_points"
+    
+    # Processing parameters
+    use_cuda: true
+    batch_size: 1
+    overlap_threshold: 0.8
+    voxel_resolution: 0.05
+    
+    # Spatial boundaries (KITTI defaults)
+    x_limits: [-48.0, 48.0]
+    y_limits: [-48.0, 48.0] 
+    z_limits: [-4.0, 1.5]
+    
+    # Things class IDs for KITTI
+    # 1: car, 2: bicycle, 3: motorcycle, 4: truck
+    # 5: other-vehicle, 6: person, 7: bicyclist, 8: motorcyclist
+    things_ids: [1, 2, 3, 4, 5, 6, 7, 8]
+    
+    # Performance settings
+    min_points_per_instance: 50
+    max_instances: 100
+    
+    # Visualization
+    publish_markers: true
+    marker_lifetime: 0.1  # seconds
+    
+    # Debug settings
+    verbose: false
+    save_timing_stats: false
+    timing_window_size: 100  # Number of frames for averaging
+
+# Alternative configuration for NuScenes dataset
+lidar_processor_nuscenes:
+  ros__parameters:
+    model_path: ""
+    num_classes: 17
+    
+    input_topic: "/lidar_points"
+    
+    use_cuda: true
+    batch_size: 1
+    overlap_threshold: 0.8
+    voxel_resolution: 0.05
+    
+    # NuScenes has different spatial bounds
+    x_limits: [-50.0, 50.0]
+    y_limits: [-50.0, 50.0]
+    z_limits: [-5.0, 3.0]
+    
+    # Things class IDs for NuScenes
+    # 2: bicycle, 3: bus, 4: car, 5: construction_vehicle
+    # 6: motorcycle, 7: pedestrian, 9: trailer, 10: truck
+    things_ids: [2, 3, 4, 5, 6, 7, 9, 10]
