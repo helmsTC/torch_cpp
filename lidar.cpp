@@ -133,9 +133,6 @@ void LidarProcessor::testModel()
         torch::Tensor dummy_features = torch::randn({num_points, 4}, device_);
         
         // The MaskPLS model expects a dictionary with 'pt_coord' and 'feats' as lists
-        // In C++, we need to use GenericDict or pass inputs differently
-        
-        // Method 1: Try passing as a tuple (if model supports it)
         std::vector<torch::jit::IValue> inputs;
         
         // Create lists of tensors
@@ -325,8 +322,7 @@ std::pair<torch::Tensor, torch::Tensor> LidarProcessor::processWithModel(
         auto pred_logits = outputs_dict.at("pred_logits").toTensor();
         auto pred_masks = outputs_dict.at("pred_masks").toTensor();
         
-        // Perform simple semantic inference for now
-        // (Full panoptic inference would require more complex processing)
+        // Perform simple semantic inference
         torch::Tensor semantic_pred = simplifiedSemanticInference(pred_logits, pred_masks, padding);
         torch::Tensor instance_pred = torch::zeros_like(semantic_pred);
         
