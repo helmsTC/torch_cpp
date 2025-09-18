@@ -97,20 +97,75 @@ class SharedMemoryInferenceServer:
         def getDir(obj):
             return os.path.dirname(os.path.abspath(obj))
         
-        # Load from original config location or provided path
-        if config_path:
-            cfg = edict(yaml.safe_load(open(config_path)))
+        cfg = edict()
+        
+        # Try to load config from file
+        if config_path and os.path.exists(config_path):
+            try:
+                with open(config_path, 'r') as f:
+                    loaded_cfg = yaml.safe_load(f)
+                    if loaded_cfg:
+                        cfg.update(loaded_cfg)
+                logger.info(f"Loaded config from: {config_path}")
+            except Exception as e:
+                logger.warning(f"Could not load config file: {e}")
         else:
+            # Try to load from original location
             config_base = os.path.join(getDir(__file__), "../original/MaskPLS/mask_pls/config")
             
-            model_cfg = edict(yaml.safe_load(open(os.path.join(config_base, "model.yaml"))))
-            backbone_cfg = edict(yaml.safe_load(open(os.path.join(config_base, "backbone.yaml"))))
-            decoder_cfg = edict(yaml.safe_load(open(os.path.join(config_base, "decoder.yaml"))))
-            
-            cfg = edict({**model_cfg, **backbone_cfg, **decoder_cfg})
+            if os.path.exists(config_base):
+                try:
+                    model_cfg_path = os.path.join(config_base, "model.yaml")
+                    backbone_cfg_path = os.path.join(config_base, "backbone.yaml") 
+                    decoder_cfg_path = os.path.join(config_base, "decoder.yaml")
+                    
+                    if os.path.exists(model_cfg_path):
+                        with open(model_cfg_path, 'r') as f:
+                            model_cfg = yaml.safe_load(f)
+                            if model_cfg:
+                                cfg.update(model_cfg)
+                    
+                    if os.path.exists(backbone_cfg_path):
+                        with open(backbone_cfg_path, 'r') as f:
+                            backbone_cfg = yaml.safe_load(f)
+                            if backbone_cfg:
+                                cfg.update(backbone_cfg)
+                    
+                    if os.path.exists(decoder_cfg_path):
+                        with open(decoder_cfg_path, 'r') as f:
+                            decoder_cfg = yaml.safe_load(f)
+                            if decoder_cfg:
+                                cfg.update(decoder_cfg)
+                    
+                    logger.info(f"Loaded configs from: {config_base}")
+                except Exception as e:
+                    logger.warning(f"Could not load original configs: {e}")
         
-        # Set default parameters
-        cfg.MODEL.DATASET = cfg.get('MODEL', {}).get('DATASET', 'KITTI')
+        # Ensure required structure exists
+        if 'MODEL' not in cfg:
+            cfg.MODEL = edict()
+        if 'TRAIN' not in cfg:
+            cfg.TRAIN = edict()
+        if 'BACKBONE' not in cfg:
+            cfg.BACKBONE = edict()
+        if 'DECODER' not in cfg:
+            cfg.DECODER = edict()
+        
+        # Set default dataset
+        if 'DATASET' not in cfg.MODEL:
+            cfg.MODEL.DATASET = 'KITTI'
+        
+        # Ensure dataset config exists
+        dataset = cfg.MODEL.DATASET
+        if dataset not in cfg:
+            cfg[dataset] = edict()
+        
+        # Set dataset defaults for KITTI
+        if dataset == 'KITTI' and 'NUM_CLASSES' not in cfg[dataset]:
+            cfg[dataset].NUM_CLASSES = 20
+            cfg[dataset].IGNORE_LABEL = 255
+        
+        # Set training defaults
         cfg.TRAIN.BATCH_SIZE = 1
         cfg.TRAIN.NUM_WORKERS = 4
         cfg.TRAIN.SUBSAMPLE = False
@@ -126,7 +181,14 @@ class SharedMemoryInferenceServer:
         checkpoint = torch.load(self.model_path, map_location='cpu')
         
         # Extract configuration and metadata
-        dataset = self.cfg.MODEL.DATASET
+        dataset = self.cfg.MODEL.DATASET if 'MODEL' in self.cfg and 'DATASET' in self.cfg.MODEL else 'KITTI'
+        
+        # Get dataset config, create if doesn't exist
+        if dataset not in self.cfg:
+            self.cfg[dataset] = edict()
+            self.cfg[dataset].NUM_CLASSES = 20  # Default for KITTI
+            self.cfg[dataset].IGNORE_LABEL = 255
+        
         self.num_classes = checkpoint.get('num_classes', self.cfg[dataset].NUM_CLASSES)
         self.things_ids = checkpoint.get('things_ids', [1, 2, 3, 4, 5, 6, 7, 8])
         self.overlap_threshold = checkpoint.get('overlap_threshold', 0.8)
@@ -154,6 +216,7 @@ class SharedMemoryInferenceServer:
         self.decoder.eval()
         
         logger.info(f"Model loaded successfully")
+        logger.info(f"  Dataset: {dataset}")
         logger.info(f"  Num classes: {self.num_classes}")
         logger.info(f"  Things IDs: {self.things_ids}")
         logger.info(f"  Device: {self.device}")
