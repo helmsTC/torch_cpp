@@ -343,17 +343,17 @@ class SharedMemoryInferenceServerGPU:
             pt_coord = torch.from_numpy(points).float().to(self.device)
             feats = torch.from_numpy(features).float().to(self.device)
             
-            # Create batch dict for MaskPLS
+            # Create batch dict for MaskPLS - ALL TENSORS MUST BE ON THE SAME DEVICE (GPU)
             batch_dict = {
-                'pt_coord': [pt_coord],
-                'feats': [feats],
-                'sem_label': [torch.zeros((points.shape[0], 1), dtype=torch.int32)],
-                'ins_label': [torch.zeros((points.shape[0], 1), dtype=torch.int32)],
-                'masks': [torch.zeros(1, points.shape[0])],
-                'masks_cls': [torch.zeros(1, dtype=torch.long)],
+                'pt_coord': [pt_coord],  # Already on GPU
+                'feats': [feats],  # Already on GPU
+                'sem_label': [torch.zeros((points.shape[0], 1), dtype=torch.int32, device=self.device)],  # FIX: Create on GPU
+                'ins_label': [torch.zeros((points.shape[0], 1), dtype=torch.int32, device=self.device)],  # FIX: Create on GPU
+                'masks': [torch.zeros(1, points.shape[0], device=self.device)],  # FIX: Create on GPU
+                'masks_cls': [torch.zeros(1, dtype=torch.long, device=self.device)],  # FIX: Create on GPU
                 'masks_ids': [[]],
                 'fname': ['inference'],
-                'pose': [np.eye(4, dtype=np.float32)],
+                'pose': [torch.from_numpy(np.eye(4, dtype=np.float32)).to(self.device)],  # FIX: Convert to GPU tensor
                 'token': ['inference_token']
             }
             
