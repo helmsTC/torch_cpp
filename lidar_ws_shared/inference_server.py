@@ -118,8 +118,9 @@ class OriginalStandaloneModel(nn.Module):
             segment_id = 0
             
             if cur_masks.shape[1] == 0:
-                sem_pred.append(sem)
-                ins_pred.append(ins)
+                # FIX: Always convert to CPU and numpy
+                sem_pred.append(sem.cpu().numpy())
+                ins_pred.append(ins.cpu().numpy())
             else:
                 cur_mask_ids = cur_prob_masks.argmax(1)
                 stuff_memory_list = {}
@@ -149,8 +150,9 @@ class OriginalStandaloneModel(nn.Module):
                         else:
                             ins[mask] = 0
                             
-                sem_pred.append(sem)
-                ins_pred.append(ins)
+                # FIX: Always convert to CPU and numpy
+                sem_pred.append(sem.cpu().numpy())
+                ins_pred.append(ins.cpu().numpy())
         
         return sem_pred, ins_pred
 
@@ -211,9 +213,9 @@ class SharedMemoryInferenceServerGPU:
             raise FileNotFoundError(f"Model file not found: {self.model_path}")
         
         try:
-            # Load the checkpoint - this should work now that we have the class defined
+            # Load the checkpoint - use weights_only=False to allow EasyDict
             logger.info("Loading checkpoint...")
-            checkpoint = torch.load(self.model_path, map_location='cpu')
+            checkpoint = torch.load(self.model_path, map_location='cpu', weights_only=False)
             
             # Extract configuration and metadata
             if not isinstance(checkpoint, dict):
@@ -224,7 +226,13 @@ class SharedMemoryInferenceServerGPU:
                 raise ValueError(f"Unexpected model class: {checkpoint['model_class']}")
             
             # Get config and metadata
-            self.cfg = checkpoint.get('config', self.get_default_config())
+            cfg = checkpoint.get('config', self.get_default_config())
+            # Convert to EasyDict if needed
+            if not isinstance(cfg, edict):
+                self.cfg = edict(cfg)
+            else:
+                self.cfg = cfg
+                
             self.things_ids = checkpoint.get('things_ids', [1, 2, 3, 4, 5, 6, 7, 8])
             self.num_classes = checkpoint.get('num_classes', 20)
             self.overlap_threshold = checkpoint.get('overlap_threshold', 0.8)
@@ -352,19 +360,12 @@ class SharedMemoryInferenceServerGPU:
             # Run through model
             outputs, padding, bb_logits = self.model(batch_dict)
             
-            # Panoptic inference
+            # Panoptic inference - already returns numpy arrays
             sem_pred, ins_pred = self.model.panoptic_inference(outputs, padding)
             
-            # Convert to numpy
-            if isinstance(sem_pred[0], torch.Tensor):
-                semantic_pred = sem_pred[0].cpu().numpy().astype(np.int32)
-            else:
-                semantic_pred = sem_pred[0].astype(np.int32)
-                
-            if isinstance(ins_pred[0], torch.Tensor):
-                instance_pred = ins_pred[0].cpu().numpy().astype(np.int32)
-            else:
-                instance_pred = ins_pred[0].astype(np.int32)
+            # Now sem_pred and ins_pred are already numpy arrays
+            semantic_pred = sem_pred[0].astype(np.int32)
+            instance_pred = ins_pred[0].astype(np.int32)
             
             return semantic_pred, instance_pred
             
