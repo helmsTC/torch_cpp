@@ -339,25 +339,22 @@ class SharedMemoryInferenceServerGPU:
     def process_point_cloud(self, points, features):
         """Run MaskPLS inference on GPU"""
         try:
-            # Move data to GPU
-            pt_coord = torch.from_numpy(points).float().to(self.device)
-            feats = torch.from_numpy(features).float().to(self.device)
-            
-            # Create batch dict for MaskPLS - ALL TENSORS MUST BE ON THE SAME DEVICE (GPU)
+            # The original MaskPLS model expects numpy arrays in the batch_dict
+            # It will handle the GPU conversion internally
             batch_dict = {
-                'pt_coord': [pt_coord],  # Already on GPU
-                'feats': [feats],  # Already on GPU
-                'sem_label': [torch.zeros((points.shape[0], 1), dtype=torch.int32, device=self.device)],  # FIX: Create on GPU
-                'ins_label': [torch.zeros((points.shape[0], 1), dtype=torch.int32, device=self.device)],  # FIX: Create on GPU
-                'masks': [torch.zeros(1, points.shape[0], device=self.device)],  # FIX: Create on GPU
-                'masks_cls': [torch.zeros(1, dtype=torch.long, device=self.device)],  # FIX: Create on GPU
+                'pt_coord': [points],  # Keep as numpy array
+                'feats': [features],  # Keep as numpy array
+                'sem_label': [np.zeros((points.shape[0], 1), dtype=np.int32)],  # numpy array
+                'ins_label': [np.zeros((points.shape[0], 1), dtype=np.int32)],  # numpy array
+                'masks': [torch.zeros(1, points.shape[0])],  # CPU tensor
+                'masks_cls': [torch.zeros(1, dtype=torch.long)],  # CPU tensor
                 'masks_ids': [[]],
                 'fname': ['inference'],
-                'pose': [torch.from_numpy(np.eye(4, dtype=np.float32)).to(self.device)],  # FIX: Convert to GPU tensor
+                'pose': [np.eye(4, dtype=np.float32)],  # numpy array
                 'token': ['inference_token']
             }
             
-            # Run through model
+            # Run through model - it will handle GPU conversion internally
             outputs, padding, bb_logits = self.model(batch_dict)
             
             # Panoptic inference - already returns numpy arrays
