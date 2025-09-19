@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-MaskPLS GPU Inference Server - Fixed version for CUDA
-This version properly handles MinkowskiEngine with GPU support
+MaskPLS GPU Inference Server - Fixed to load converted models properly
+This version defines the model class before loading to avoid unpickling errors
 """
 
 import os
@@ -25,63 +25,139 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Add the original model path to Python path
+# CRITICAL: Add the original model path to Python path BEFORE any imports
 original_path = os.path.join(os.path.dirname(__file__), "../original/MaskPLS")
-if original_path not in sys.path and os.path.exists(original_path):
+if os.path.exists(original_path):
     sys.path.insert(0, original_path)
+    logger.info(f"Added to path: {original_path}")
+else:
+    logger.warning(f"Original MaskPLS path not found: {original_path}")
 
-# Try to import MinkowskiEngine
+# Import MinkowskiEngine FIRST
 try:
     import MinkowskiEngine as ME
     HAS_MINKOWSKI = True
-    logger.info("MinkowskiEngine available")
+    logger.info("✓ MinkowskiEngine imported successfully")
 except ImportError as e:
     logger.error(f"MinkowskiEngine not available: {e}")
-    logger.error("Please install MinkowskiEngine with CUDA support:")
-    logger.error("  pip install git+https://github.com/NVIDIA/MinkowskiEngine.git")
+    sys.exit(1)
+
+# Import MaskPLS models BEFORE defining the model class
+try:
+    from mask_pls.models.mink import MinkEncoderDecoder
+    from mask_pls.models.decoder import MaskedTransformerDecoder
+    logger.info("✓ MaskPLS models imported successfully")
+except ImportError as e:
+    logger.error(f"Cannot import MaskPLS models: {e}")
+    logger.error("Make sure the original MaskPLS code is in the correct path")
     sys.exit(1)
 
 
-def load_checkpoint_safe(model_path, device='cuda'):
-    """
-    Safely load checkpoint with proper error handling
-    """
-    if not os.path.exists(model_path):
-        raise FileNotFoundError(f"Model file not found: {model_path}")
+# CRITICAL: Define the EXACT SAME model class used in the converter
+class OriginalStandaloneModel(nn.Module):
+    """Standalone inference model using original MinkowskiEngine architecture"""
     
-    logger.info(f"Loading checkpoint from: {model_path}")
+    def __init__(self, cfg, things_ids):
+        super().__init__()
+        
+        dataset = cfg.MODEL.DATASET
+        self.cfg = cfg
+        self.num_classes = cfg[dataset].NUM_CLASSES
+        self.ignore_label = cfg[dataset].IGNORE_LABEL
+        self.things_ids = things_ids
+        self.overlap_threshold = cfg.MODEL.OVERLAP_THRESHOLD
+        
+        # Create the ORIGINAL components
+        backbone = MinkEncoderDecoder(cfg.BACKBONE, cfg[dataset])
+        self.backbone = ME.MinkowskiSyncBatchNorm.convert_sync_batchnorm(backbone)
+        
+        self.decoder = MaskedTransformerDecoder(
+            cfg.DECODER,
+            cfg.BACKBONE,
+            cfg[dataset]
+        )
+        
+        logger.info(f"OriginalStandaloneModel initialized:")
+        logger.info(f"  Num classes: {self.num_classes}")
+        logger.info(f"  Things IDs: {self.things_ids}")
     
-    try:
-        # First try direct GPU load
-        checkpoint = torch.load(model_path, map_location=device)
-        logger.info(f"✓ Checkpoint loaded on {device}")
-        return checkpoint
+    @torch.no_grad()
+    def forward(self, batch_dict):
+        """Forward pass matching the original training model"""
+        feats, coords, pad_masks, bb_logits = self.backbone(batch_dict)
+        outputs, padding = self.decoder(feats, coords, pad_masks)
+        return outputs, padding, bb_logits
+    
+    def panoptic_inference(self, outputs, padding):
+        """Panoptic segmentation inference"""
+        mask_cls = outputs["pred_logits"]
+        mask_pred = outputs["pred_masks"]
+        things_ids = self.things_ids
+        num_classes = self.num_classes
         
-    except Exception as e:
-        logger.warning(f"Direct GPU load failed: {e}")
+        sem_pred = []
+        ins_pred = []
         
-        # Try CPU first then move to GPU
-        try:
-            checkpoint = torch.load(model_path, map_location='cpu')
-            logger.info("✓ Checkpoint loaded on CPU, will move to GPU")
-            return checkpoint
+        for mask_cls, mask_pred, pad in zip(mask_cls, mask_pred, padding):
+            scores, labels = mask_cls.max(-1)
+            mask_pred = mask_pred[~pad].sigmoid()
+            keep = labels.ne(num_classes)
             
-        except Exception as e2:
-            logger.error(f"Failed to load checkpoint: {e2}")
+            cur_scores = scores[keep]
+            cur_classes = labels[keep]
+            cur_masks = mask_pred[:, keep]
             
-            # Last resort - try to extract metadata only
-            metadata = {
-                'num_classes': 20,
-                'things_ids': [1, 2, 3, 4, 5, 6, 7, 8],
-                'overlap_threshold': 0.8
-            }
-            logger.warning("Using default metadata")
-            return metadata
+            cur_prob_masks = cur_scores.unsqueeze(0) * cur_masks
+            
+            panoptic_seg = torch.zeros(
+                (cur_masks.shape[0]), dtype=torch.int32, device=cur_masks.device
+            )
+            sem = torch.zeros_like(panoptic_seg)
+            ins = torch.zeros_like(panoptic_seg)
+            
+            segment_id = 0
+            
+            if cur_masks.shape[1] == 0:
+                sem_pred.append(sem)
+                ins_pred.append(ins)
+            else:
+                cur_mask_ids = cur_prob_masks.argmax(1)
+                stuff_memory_list = {}
+                
+                for k in range(cur_classes.shape[0]):
+                    pred_class = cur_classes[k].item()
+                    isthing = pred_class in things_ids
+                    mask_area = (cur_mask_ids == k).sum().item()
+                    original_area = (cur_masks[:, k] >= 0.5).sum().item()
+                    mask = (cur_mask_ids == k) & (cur_masks[:, k] >= 0.5)
+                    
+                    if mask_area > 0 and original_area > 0 and mask.sum().item() > 0:
+                        if mask_area / original_area < self.overlap_threshold:
+                            continue
+                        if not isthing:
+                            if int(pred_class) in stuff_memory_list.keys():
+                                panoptic_seg[mask] = stuff_memory_list[int(pred_class)]
+                                continue
+                            else:
+                                stuff_memory_list[int(pred_class)] = segment_id + 1
+                        segment_id += 1
+                        panoptic_seg[mask] = segment_id
+                        
+                        sem[mask] = pred_class
+                        if isthing:
+                            ins[mask] = segment_id
+                        else:
+                            ins[mask] = 0
+                            
+                sem_pred.append(sem)
+                ins_pred.append(ins)
+        
+        return sem_pred, ins_pred
 
 
 class SharedMemoryInferenceServerGPU:
     """
-    GPU inference server with MinkowskiEngine support
+    GPU inference server with proper model loading
     """
     
     # Shared memory configuration
@@ -98,9 +174,8 @@ class SharedMemoryInferenceServerGPU:
     FLAG_SHUTDOWN = 5
     
     def __init__(self, model_path, config_path=None):
-        """
-        Initialize the GPU inference server
-        """
+        """Initialize the GPU inference server"""
+        
         self.model_path = model_path
         
         # Check CUDA availability
@@ -108,17 +183,14 @@ class SharedMemoryInferenceServerGPU:
             raise RuntimeError("CUDA not available! This server requires GPU.")
         
         self.device = torch.device('cuda')
-        torch.cuda.set_device(0)  # Use first GPU
+        torch.cuda.set_device(0)
         
         logger.info(f"Initializing MaskPLS GPU Inference Server")
         logger.info(f"Using device: {torch.cuda.get_device_name(0)}")
         logger.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
         
-        # Load configuration
-        self.cfg = self.load_config(config_path)
-        
-        # Load model
-        self.load_model()
+        # Load model (this must happen before shared memory to ensure model loads properly)
+        self.load_model_properly()
         
         # Initialize shared memory
         self.init_shared_memory()
@@ -128,168 +200,113 @@ class SharedMemoryInferenceServerGPU:
         signal.signal(signal.SIGTERM, self.signal_handler)
         
         self.running = False
+    
+    def load_model_properly(self):
+        """
+        Load the converted model properly to avoid unpickling errors
+        """
+        logger.info(f"Loading model from: {self.model_path}")
         
-    def load_config(self, config_path=None):
-        """Load configuration with defaults"""
+        if not os.path.exists(self.model_path):
+            raise FileNotFoundError(f"Model file not found: {self.model_path}")
         
-        # Start with minimal defaults
-        cfg = edict({
+        try:
+            # Load the checkpoint - this should work now that we have the class defined
+            logger.info("Loading checkpoint...")
+            checkpoint = torch.load(self.model_path, map_location='cpu')
+            
+            # Extract configuration and metadata
+            if not isinstance(checkpoint, dict):
+                raise ValueError("Checkpoint is not a dictionary. Was the model converted properly?")
+            
+            # Check if this is a converted model
+            if 'model_class' in checkpoint and checkpoint['model_class'] != 'OriginalStandaloneModel':
+                raise ValueError(f"Unexpected model class: {checkpoint['model_class']}")
+            
+            # Get config and metadata
+            self.cfg = checkpoint.get('config', self.get_default_config())
+            self.things_ids = checkpoint.get('things_ids', [1, 2, 3, 4, 5, 6, 7, 8])
+            self.num_classes = checkpoint.get('num_classes', 20)
+            self.overlap_threshold = checkpoint.get('overlap_threshold', 0.8)
+            
+            logger.info(f"Checkpoint loaded successfully:")
+            logger.info(f"  Num classes: {self.num_classes}")
+            logger.info(f"  Things IDs: {self.things_ids}")
+            logger.info(f"  Architecture: {checkpoint.get('architecture', 'Unknown')}")
+            
+            # Create the model with the same configuration
+            logger.info("Creating model...")
+            self.model = OriginalStandaloneModel(self.cfg, self.things_ids)
+            
+            # Load the state dict
+            if 'model_state_dict' in checkpoint:
+                logger.info("Loading model weights...")
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                logger.info("✓ Model weights loaded successfully")
+            elif 'backbone_state_dict' in checkpoint and 'decoder_state_dict' in checkpoint:
+                logger.info("Loading backbone and decoder weights separately...")
+                self.model.backbone.load_state_dict(checkpoint['backbone_state_dict'])
+                self.model.decoder.load_state_dict(checkpoint['decoder_state_dict'])
+                logger.info("✓ Weights loaded successfully")
+            else:
+                logger.warning("No model weights found in checkpoint, using random initialization")
+            
+            # Move model to GPU and set to eval mode
+            self.model = self.model.to(self.device)
+            self.model.eval()
+            
+            logger.info("✓ Model loaded and ready on GPU")
+            
+        except Exception as e:
+            logger.error(f"Failed to load model: {e}")
+            logger.error("Stack trace:", exc_info=True)
+            
+            # Try to provide helpful debugging info
+            try:
+                checkpoint_keys = torch.load(self.model_path, map_location='cpu', weights_only=False).keys()
+                logger.info(f"Checkpoint contains keys: {list(checkpoint_keys)[:10]}...")
+            except:
+                pass
+            
+            raise RuntimeError(f"Cannot load model from {self.model_path}: {e}")
+    
+    def get_default_config(self):
+        """Get default configuration if not in checkpoint"""
+        return edict({
             'MODEL': {'DATASET': 'KITTI', 'OVERLAP_THRESHOLD': 0.8},
             'KITTI': {'NUM_CLASSES': 20, 'IGNORE_LABEL': 255},
             'BACKBONE': {'CHANNELS': [64, 128, 256, 512]},
             'DECODER': {'HIDDEN_DIM': 256, 'NUM_HEADS': 8, 'NUM_LAYERS': 6},
             'TRAIN': {'BATCH_SIZE': 1, 'NUM_WORKERS': 4, 'SUBSAMPLE': False, 'AUG': False}
         })
-        
-        # Try to load from file if provided
-        if config_path and os.path.exists(config_path):
-            try:
-                with open(config_path, 'r') as f:
-                    loaded_cfg = yaml.safe_load(f)
-                    if loaded_cfg:
-                        # Recursively update config
-                        def update_dict(d, u):
-                            for k, v in u.items():
-                                if isinstance(v, dict):
-                                    d[k] = update_dict(d.get(k, {}), v)
-                                else:
-                                    d[k] = v
-                            return d
-                        cfg = edict(update_dict(cfg, loaded_cfg))
-                logger.info(f"Loaded config from: {config_path}")
-            except Exception as e:
-                logger.warning(f"Could not load config file: {e}")
-        
-        return cfg
-    
-    def load_model(self):
-        """Load the MaskPLS model with MinkowskiEngine"""
-        
-        # Load checkpoint
-        checkpoint = load_checkpoint_safe(self.model_path, self.device)
-        
-        # Extract metadata
-        if isinstance(checkpoint, dict):
-            dataset = self.cfg.MODEL.DATASET
-            self.num_classes = checkpoint.get('num_classes', self.cfg[dataset].NUM_CLASSES)
-            self.things_ids = checkpoint.get('things_ids', [1, 2, 3, 4, 5, 6, 7, 8])
-            self.overlap_threshold = checkpoint.get('overlap_threshold', 0.8)
-        else:
-            # Using defaults
-            self.num_classes = 20
-            self.things_ids = [1, 2, 3, 4, 5, 6, 7, 8]
-            self.overlap_threshold = 0.8
-        
-        logger.info(f"Model configuration:")
-        logger.info(f"  Num classes: {self.num_classes}")
-        logger.info(f"  Things IDs: {self.things_ids}")
-        
-        # Try to create model components
-        try:
-            # Import MaskPLS models
-            from mask_pls.models.mink import MinkEncoderDecoder
-            from mask_pls.models.decoder import MaskedTransformerDecoder
-            
-            dataset = self.cfg.MODEL.DATASET
-            
-            # Create model components
-            self.backbone = MinkEncoderDecoder(self.cfg.BACKBONE, self.cfg[dataset])
-            self.backbone = ME.MinkowskiSyncBatchNorm.convert_sync_batchnorm(self.backbone)
-            
-            self.decoder = MaskedTransformerDecoder(
-                self.cfg.DECODER,
-                self.cfg.BACKBONE,
-                self.cfg[dataset]
-            )
-            
-            # Load weights if available
-            if isinstance(checkpoint, dict):
-                if 'backbone_state_dict' in checkpoint:
-                    self.backbone.load_state_dict(checkpoint['backbone_state_dict'])
-                    logger.info("✓ Loaded backbone weights")
-                if 'decoder_state_dict' in checkpoint:
-                    self.decoder.load_state_dict(checkpoint['decoder_state_dict'])
-                    logger.info("✓ Loaded decoder weights")
-            
-            # Move to GPU and set to eval mode
-            self.backbone = self.backbone.to(self.device)
-            self.decoder = self.decoder.to(self.device)
-            self.backbone.eval()
-            self.decoder.eval()
-            
-            logger.info("✓ Model loaded successfully on GPU")
-            
-        except ImportError as e:
-            logger.error(f"Cannot import MaskPLS models: {e}")
-            logger.error("Creating simplified model instead...")
-            self.create_simple_model()
-            
-        except Exception as e:
-            logger.error(f"Error creating model: {e}")
-            logger.error("Creating simplified model instead...")
-            self.create_simple_model()
-    
-    def create_simple_model(self):
-        """Create a simple model if MaskPLS models can't be loaded"""
-        logger.warning("Using simplified model (not full MaskPLS)")
-        
-        class SimpleModel(nn.Module):
-            def __init__(self, num_classes):
-                super().__init__()
-                self.fc1 = nn.Linear(4, 128)
-                self.fc2 = nn.Linear(128, 256)
-                self.fc3 = nn.Linear(256, 128)
-                self.fc4 = nn.Linear(128, num_classes)
-                
-            def forward(self, x):
-                x = torch.relu(self.fc1(x))
-                x = torch.relu(self.fc2(x))
-                x = torch.relu(self.fc3(x))
-                return self.fc4(x)
-        
-        self.simple_model = SimpleModel(self.num_classes).to(self.device)
-        self.simple_model.eval()
-        self.use_simple = True
     
     def init_shared_memory(self):
         """Initialize shared memory segments"""
-        # Maximum sizes
         self.max_points = 150000
-        self.input_size = self.max_points * 4 * 4  # N x 4 floats
-        self.output_size = self.max_points * 2 * 4  # N x 2 ints
+        self.input_size = self.max_points * 4 * 4
+        self.output_size = self.max_points * 2 * 4
         self.control_size = 32
         
         # Clean up any existing segments
         self.cleanup_shared_memory()
         
         try:
-            # Create new shared memory segments
             self.input_shm = shared_memory.SharedMemory(
-                create=True,
-                size=self.input_size,
-                name=self.INPUT_SHM_NAME
+                create=True, size=self.input_size, name=self.INPUT_SHM_NAME
             )
-            
             self.output_shm = shared_memory.SharedMemory(
-                create=True,
-                size=self.output_size,
-                name=self.OUTPUT_SHM_NAME
+                create=True, size=self.output_size, name=self.OUTPUT_SHM_NAME
             )
-            
             self.control_shm = shared_memory.SharedMemory(
-                create=True,
-                size=self.control_size,
-                name=self.CONTROL_SHM_NAME
+                create=True, size=self.control_size, name=self.CONTROL_SHM_NAME
             )
             
-            # Create numpy arrays backed by shared memory
             self.control_array = np.ndarray(
                 (8,), dtype=np.int32, buffer=self.control_shm.buf
             )
-            self.control_array[:] = 0  # Initialize to zeros
+            self.control_array[:] = 0
             
-            logger.info(f"✓ Shared memory initialized")
-            logger.info(f"  Max points: {self.max_points}")
+            logger.info(f"✓ Shared memory initialized (max {self.max_points} points)")
             
         except Exception as e:
             logger.error(f"Failed to create shared memory: {e}")
@@ -312,132 +329,60 @@ class SharedMemoryInferenceServerGPU:
     
     @torch.no_grad()
     def process_point_cloud(self, points, features):
-        """
-        Run MaskPLS inference on GPU
-        """
+        """Run MaskPLS inference on GPU"""
         try:
-            # Convert to torch tensors and move to GPU
+            # Move data to GPU
             pt_coord = torch.from_numpy(points).float().to(self.device)
             feats = torch.from_numpy(features).float().to(self.device)
             
-            if hasattr(self, 'use_simple') and self.use_simple:
-                # Use simple model
-                logits = self.simple_model(feats)
-                semantic_pred = torch.argmax(logits, dim=-1).cpu().numpy().astype(np.int32)
-                instance_pred = np.zeros(len(points), dtype=np.int32)
-                
-            else:
-                # Use full MaskPLS model
-                # Create batch dict
-                batch_dict = {
-                    'pt_coord': [pt_coord],
-                    'feats': [feats],
-                    'sem_label': [torch.zeros((points.shape[0], 1), dtype=torch.int32)],
-                    'ins_label': [torch.zeros((points.shape[0], 1), dtype=torch.int32)],
-                    'masks': [torch.zeros(1, points.shape[0])],
-                    'masks_cls': [torch.zeros(1, dtype=torch.long)],
-                    'masks_ids': [[]],
-                    'fname': ['inference'],
-                    'pose': [np.eye(4, dtype=np.float32)],
-                    'token': ['inference_token']
-                }
-                
-                # Run through backbone
-                feats_out, coords, pad_masks, bb_logits = self.backbone(batch_dict)
-                
-                # Run through decoder
-                outputs, padding = self.decoder(feats_out, coords, pad_masks)
-                
-                # Panoptic inference
-                sem_pred, ins_pred = self.panoptic_inference(outputs, padding)
-                
+            # Create batch dict for MaskPLS
+            batch_dict = {
+                'pt_coord': [pt_coord],
+                'feats': [feats],
+                'sem_label': [torch.zeros((points.shape[0], 1), dtype=torch.int32)],
+                'ins_label': [torch.zeros((points.shape[0], 1), dtype=torch.int32)],
+                'masks': [torch.zeros(1, points.shape[0])],
+                'masks_cls': [torch.zeros(1, dtype=torch.long)],
+                'masks_ids': [[]],
+                'fname': ['inference'],
+                'pose': [np.eye(4, dtype=np.float32)],
+                'token': ['inference_token']
+            }
+            
+            # Run through model
+            outputs, padding, bb_logits = self.model(batch_dict)
+            
+            # Panoptic inference
+            sem_pred, ins_pred = self.model.panoptic_inference(outputs, padding)
+            
+            # Convert to numpy
+            if isinstance(sem_pred[0], torch.Tensor):
                 semantic_pred = sem_pred[0].cpu().numpy().astype(np.int32)
+            else:
+                semantic_pred = sem_pred[0].astype(np.int32)
+                
+            if isinstance(ins_pred[0], torch.Tensor):
                 instance_pred = ins_pred[0].cpu().numpy().astype(np.int32)
+            else:
+                instance_pred = ins_pred[0].astype(np.int32)
             
             return semantic_pred, instance_pred
             
         except Exception as e:
             logger.error(f"Error during inference: {e}")
-            import traceback
-            traceback.print_exc()
+            logger.error("Stack trace:", exc_info=True)
             
             # Return zeros on error
             return (np.zeros(len(points), dtype=np.int32),
                    np.zeros(len(points), dtype=np.int32))
     
-    def panoptic_inference(self, outputs, padding):
-        """Panoptic segmentation inference"""
-        mask_cls = outputs["pred_logits"]
-        mask_pred = outputs["pred_masks"]
-        
-        sem_pred = []
-        ins_pred = []
-        
-        for mask_cls, mask_pred, pad in zip(mask_cls, mask_pred, padding):
-            scores, labels = mask_cls.max(-1)
-            mask_pred = mask_pred[~pad].sigmoid()
-            keep = labels.ne(self.num_classes)
-            
-            cur_scores = scores[keep]
-            cur_classes = labels[keep]
-            cur_masks = mask_pred[:, keep]
-            
-            # Probability to belong to each mask
-            cur_prob_masks = cur_scores.unsqueeze(0) * cur_masks
-            
-            panoptic_seg = torch.zeros(
-                (cur_masks.shape[0]), dtype=torch.int32, device=cur_masks.device
-            )
-            sem = torch.zeros_like(panoptic_seg)
-            ins = torch.zeros_like(panoptic_seg)
-            
-            segment_id = 0
-            
-            if cur_masks.shape[1] == 0:  # No masks detected
-                sem_pred.append(sem)
-                ins_pred.append(ins)
-            else:
-                # Mask index for each point
-                cur_mask_ids = cur_prob_masks.argmax(1)
-                stuff_memory_list = {}
-                
-                for k in range(cur_classes.shape[0]):
-                    pred_class = cur_classes[k].item()
-                    isthing = pred_class in self.things_ids
-                    mask_area = (cur_mask_ids == k).sum().item()
-                    original_area = (cur_masks[:, k] >= 0.5).sum().item()
-                    mask = (cur_mask_ids == k) & (cur_masks[:, k] >= 0.5)
-                    
-                    if mask_area > 0 and original_area > 0 and mask.sum().item() > 0:
-                        if mask_area / original_area < self.overlap_threshold:
-                            continue
-                        
-                        if not isthing:  # Merge stuff regions
-                            if int(pred_class) in stuff_memory_list.keys():
-                                panoptic_seg[mask] = stuff_memory_list[int(pred_class)]
-                                continue
-                            else:
-                                stuff_memory_list[int(pred_class)] = segment_id + 1
-                        
-                        segment_id += 1
-                        panoptic_seg[mask] = segment_id
-                        
-                        sem[mask] = pred_class
-                        if isthing:
-                            ins[mask] = segment_id
-                        else:
-                            ins[mask] = 0
-                
-                sem_pred.append(sem)
-                ins_pred.append(ins)
-        
-        return sem_pred, ins_pred
-    
     def run(self):
         """Main inference loop"""
         self.running = True
+        logger.info("="*60)
         logger.info("GPU Server ready - waiting for requests...")
         logger.info("Press Ctrl+C to stop")
+        logger.info("="*60)
         
         # Performance tracking
         inference_times = []
@@ -461,36 +406,30 @@ class SharedMemoryInferenceServerGPU:
                     if num_points > 0 and num_points <= self.max_points:
                         self.control_array[0] = self.FLAG_PROCESSING
                         
-                        # Synchronize GPU
                         torch.cuda.synchronize()
                         start_time = time.time()
                         
-                        # Read input data
+                        # Read input
                         input_array = np.ndarray(
-                            (num_points, 4),
-                            dtype=np.float32,
+                            (num_points, 4), dtype=np.float32,
                             buffer=self.input_shm.buf
                         )
                         points = input_array[:, :3].copy()
                         features = input_array.copy()
                         
-                        # Process on GPU
-                        semantic_pred, instance_pred = self.process_point_cloud(
-                            points, features
-                        )
+                        # Process
+                        semantic_pred, instance_pred = self.process_point_cloud(points, features)
                         
                         # Write output
                         output_array = np.ndarray(
-                            (num_points, 2),
-                            dtype=np.int32,
+                            (num_points, 2), dtype=np.int32,
                             buffer=self.output_shm.buf
                         )
                         output_array[:, 0] = semantic_pred
                         output_array[:, 1] = instance_pred
                         
-                        # Synchronize and measure time
                         torch.cuda.synchronize()
-                        inference_time = (time.time() - start_time) * 1000  # ms
+                        inference_time = (time.time() - start_time) * 1000
                         
                         inference_times.append(inference_time)
                         frame_count += 1
@@ -502,11 +441,9 @@ class SharedMemoryInferenceServerGPU:
                         # Log performance
                         if frame_count % 10 == 0:
                             avg_time = np.mean(inference_times[-10:])
-                            logger.info(f"GPU Processing - Frame {frame_count}, "
-                                      f"Points: {num_points}, "
-                                      f"Time: {inference_time:.1f}ms, "
-                                      f"Avg: {avg_time:.1f}ms, "
-                                      f"FPS: {1000/avg_time:.1f}")
+                            logger.info(f"Frame {frame_count}: {num_points} points, "
+                                      f"{inference_time:.1f}ms (avg: {avg_time:.1f}ms, "
+                                      f"{1000/avg_time:.1f} FPS)")
                     else:
                         logger.error(f"Invalid number of points: {num_points}")
                         self.control_array[0] = self.FLAG_ERROR
@@ -523,7 +460,7 @@ class SharedMemoryInferenceServerGPU:
                 logger.error(f"Error in main loop: {e}")
                 self.control_array[0] = self.FLAG_ERROR
         
-        logger.info("Shutting down GPU inference server...")
+        logger.info("Shutting down...")
         self.cleanup()
     
     def cleanup(self):
@@ -531,11 +468,9 @@ class SharedMemoryInferenceServerGPU:
         try:
             self.control_array[0] = self.FLAG_SHUTDOWN
             
-            # Clear GPU cache
             if torch.cuda.is_available():
                 torch.cuda.empty_cache()
             
-            # Close shared memory
             self.input_shm.close()
             self.output_shm.close()
             self.control_shm.close()
@@ -551,8 +486,8 @@ class SharedMemoryInferenceServerGPU:
 
 
 def main():
-    parser = argparse.ArgumentParser(description='MaskPLS GPU Inference Server')
-    parser.add_argument('--model', required=True, help='Path to model file')
+    parser = argparse.ArgumentParser(description='MaskPLS GPU Inference Server (Fixed)')
+    parser.add_argument('--model', required=True, help='Path to converted model file')
     parser.add_argument('--config', help='Path to config file (optional)')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose logging')
     
@@ -564,8 +499,6 @@ def main():
     # Check GPU availability
     if not torch.cuda.is_available():
         logger.error("CUDA not available! This server requires GPU.")
-        logger.error("Please check your PyTorch installation:")
-        logger.error("  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu118")
         sys.exit(1)
     
     # Create and run server
